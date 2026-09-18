@@ -1,384 +1,187 @@
-import os
-import time
-import logging
-import requests
-import ccxt
-import pandas as pd
+import os, time, traceback
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
+print('=== CRYPTO SCALP BOT V2 STARTING ===', flush=True)
+print('Python process started', flush=True)
 
-SYMBOLS = os.getenv(
-    "SYMBOLS",
-    "BTC/USDT:USDT ETH/USDT:USDT NEAR/USDT:USDT PYTH/USDT:USDT ADA/USDT:USDT "
-    "ENA/USDT:USDT FET/USDT:USDT VIRTUAL/USDT:USDT TAO/USDT:USDT PENDLE/USDT:USDT "
-    "JUP/USDT:USDT INJ/USDT:USDT AAVE/USDT:USDT LINK/USDT:USDT",
-).split()
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-LEV = int(os.getenv("LEVERAGE", "30"))
-FAST_SECONDS = int(os.getenv("FAST_SECONDS", "300"))
-MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.7"))
-MAX_CHASE_PCT = float(os.getenv("MAX_CHASE_PCT", "0.45"))
-COOLDOWN = int(os.getenv("COOLDOWN", "1800"))
-PAUSE = float(os.getenv("PAUSE", "1.5"))
+try:
+    import ccxt
+    import requests
+    print('Imports OK', flush=True)
+except Exception as e:
+    print('IMPORT ERROR:', repr(e), flush=True)
+    traceback.print_exc()
+    raise
 
-exchange = ccxt.mexc({"enableRateLimit": True, "options": {"defaultType": "swap"}})
-last_alert = {}
-last_state = {}
+SYMBOLS = [s.strip() for s in os.getenv('SYMBOLS', 'BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,XRP/USDT:USDT,HBAR/USDT:USDT,FET/USDT:USDT,JUP/USDT:USDT,LINK/USDT:USDT,VIRTUAL/USDT:USDT').split(',') if s.strip()]
+SCAN_SECONDS = max(10, int(os.getenv('SCAN_SECONDS', '20')))
+COOLDOWN_SECONDS = max(60, int(os.getenv('COOLDOWN_SECONDS', '900')))
+MIN_ROOM = float(os.getenv('MIN_ROOM', '0.005'))
+MAX_ROOM = float(os.getenv('MAX_ROOM', '0.007'))
+LEVERAGE = int(os.getenv('LEVERAGE', '30'))
+TG = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
+CHAT = os.getenv('TELEGRAM_CHAT_ID', '').strip()
+last_sent = {}
+
+print('Symbols:', ', '.join(SYMBOLS), flush=True)
+print('Telegram configured:', bool(TG and CHAT), flush=True)
+print('Chat ID configured:', CHAT if CHAT else '<empty>', flush=True)
+
+ex = ccxt.mexc({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
 
 
-def tg(msg):
-    if not TOKEN or not CHAT_ID:
-        logging.warning("Telegram variables are missing")
+def send(text):
+    if not TG or not CHAT:
+        print('[TG] NOT CONFIGURED', flush=True)
+        print(text, flush=True)
         return False
     try:
         r = requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": msg},
+            f'https://api.telegram.org/bot{TG}/sendMessage',
+            json={'chat_id': CHAT, 'text': text, 'parse_mode': 'HTML'},
             timeout=10,
         )
-        if r.status_code != 200:
-            logging.warning("telegram status=%s body=%s", r.status_code, r.text[:200])
+        print(f'[TG] HTTP {r.status_code}', flush=True)
+        if not r.ok:
+            print('[TG] RESPONSE', r.text[:500], flush=True)
             return False
         return True
     except Exception as e:
-        logging.warning("telegram error: %s", e)
+        print('[TG ERROR]', repr(e), flush=True)
         return False
 
 
-def get(symbol, timeframe="5m", limit=180):
+def fetch(symbol, timeframe, limit):
     try:
-        x = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        d = pd.DataFrame(x, columns=["ts", "open", "high", "low", "close", "volume"])
-        # Never use the still-forming candle.
-        return d.iloc[:-1].reset_index(drop=True) if len(d) > 3 else pd.DataFrame()
+        rows = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        return rows
     except Exception as e:
-        logging.warning("%s %s fetch error: %s", symbol, timeframe, e)
-        return pd.DataFrame()
-
-
-def atr(d, n=14):
-    tr = pd.concat(
-        [d.high - d.low, (d.high - d.close.shift()).abs(), (d.low - d.close.shift()).abs()],
-        axis=1,
-    ).max(axis=1)
-    return tr.rolling(n).mean()
-
-
-def add(d):
-    d = d.copy()
-    d["ema14"] = d.close.ewm(span=14, adjust=False).mean()
-    d["ema30"] = d.close.ewm(span=30, adjust=False).mean()
-    d["atr"] = atr(d)
-    return d
-
-
-def trend(d):
-    if len(d) < 35:
-        return None
-    if d.ema14.iloc[-1] > d.ema30.iloc[-1]:
-        return "LONG"
-    if d.ema14.iloc[-1] < d.ema30.iloc[-1]:
-        return "SHORT"
-    return None
-
-
-def candle_side(r):
-    if r.close > r.open:
-        return "LONG"
-    if r.close < r.open:
-        return "SHORT"
-    return None
-
-
-def liquidity_sweep(d, lookback=8):
-    if len(d) < lookback + 3:
-        return None, None, None
-    c = d.iloc[-1]
-    prev = d.iloc[-lookback - 1 : -1]
-    lo, hi = prev.low.min(), prev.high.max()
-    if c.low < lo and c.close > lo:
-        return "LONG", float(c.low), float(lo)
-    if c.high > hi and c.close < hi:
-        return "SHORT", float(c.high), float(hi)
-    return None, None, None
-
-
-def displacement(d):
-    if len(d) < 20:
-        return None
-    c = d.iloc[-1]
-    a = d.atr.iloc[-1]
-    if pd.isna(a) or a <= 0:
-        return None
-    return candle_side(c) if abs(c.close - c.open) >= 1.05 * a else None
-
-
-def bos(d, side, lookback=4):
-    if len(d) < lookback + 3:
-        return False
-    c = d.iloc[-1]
-    prev = d.iloc[-lookback - 1 : -1]
-    return bool(c.close > prev.high.max()) if side == "LONG" else bool(c.close < prev.low.min())
-
-
-def reaction(d, side):
-    if len(d) < 3:
-        return False
-    c, p = d.iloc[-1], d.iloc[-2]
-    return bool(c.close > c.open and c.close > p.close) if side == "LONG" else bool(c.close < c.open and c.close < p.close)
-
-
-def event_flags(d, side, window=12):
-    """Return recent event indexes in chronological order on closed candles only."""
-    start = max(30, len(d) - window)
-    events = {"sweep": [], "disp": [], "bos": [], "reaction": []}
-    for i in range(start, len(d)):
-        sub = add(d.iloc[: i + 1].copy())
-        s, _, _ = liquidity_sweep(sub)
-        if s == side:
-            events["sweep"].append(i)
-        if displacement(sub) == side:
-            events["disp"].append(i)
-        if bos(sub, side):
-            events["bos"].append(i)
-        if reaction(sub, side):
-            events["reaction"].append(i)
-    return events
-
-
-def latest_index(events, key):
-    return events[key][-1] if events[key] else None
-
-
-def sequence_ok(events, side):
-    """Require the core sequence to happen in order and remain fresh."""
-    sweeps = events["sweep"]
-    disps = events["disp"]
-    bosses = events["bos"]
-    reacts = events["reaction"]
-    if not sweeps or not disps or not bosses or not reacts:
-        return False
-    # Find a sweep -> displacement -> BOS chain within the inspected window.
-    for s in reversed(sweeps):
-        dps = [x for x in disps if x > s]
-        if not dps:
-            continue
-        d_i = dps[0]
-        bps = [x for x in bosses if x > d_i]
-        if not bps:
-            continue
-        b_i = bps[0]
-        # Reaction can be the displacement candle or a candle around the BOS.
-        if any(abs(r - b_i) <= 2 or abs(r - d_i) <= 2 for r in reacts):
-            return True
-    return False
-
-
-def pivot_levels(d, side, left=2, right=2, lookback=72):
-    """Build meaningful swing levels instead of treating every wick as liquidity."""
-    w = d.iloc[-lookback:].reset_index(drop=True)
-    levels = []
-    if len(w) < left + right + 3:
-        return levels
-    for i in range(left, len(w) - right):
-        hi = float(w.high.iloc[i])
-        lo = float(w.low.iloc[i])
-        if side == "LONG":
-            if hi >= float(w.high.iloc[i-left:i].max()) and hi >= float(w.high.iloc[i+1:i+right+1].max()):
-                levels.append(hi)
-        else:
-            if lo <= float(w.low.iloc[i-left:i].min()) and lo <= float(w.low.iloc[i+1:i+right+1].min()):
-                levels.append(lo)
-    return sorted(set(levels))
-
-
-def actual_room(d, side, price, min_room=0.0):
-    """Return nearest meaningful opposing swing target; no synthetic TP for confirmation."""
-    levels = pivot_levels(d, side)
-    if side == "LONG":
-        candidates = [x for x in levels if x > price and ((x / price - 1) * 100) >= min_room]
-        target = min(candidates) if candidates else None
-        return ((target / price - 1) * 100, target) if target else (0.0, None)
-    candidates = [x for x in levels if x < price and ((1 - x / price) * 100) >= min_room]
-    target = max(candidates) if candidates else None
-    return ((1 - target / price) * 100, target) if target else (0.0, None)
-
-
-def event_anchor(d, side, events):
-    idxs = sorted(set(events["sweep"] + events["disp"] + events["bos"]))
-    if not idxs:
-        return None
-    i = idxs[-1]
-    # Only the last 3 closed candles can define the anti-chase anchor.
-    if len(d) - 1 - i > 2:
-        return None
-    return float(d.close.iloc[i])
-
-
-def signal_for(symbol, d5, d15, d1h):
-    d5, d15, d1h = add(d5), add(d15), add(d1h)
-    if len(d5) < 60 or len(d15) < 35 or len(d1h) < 35:
+        print(f'[FETCH ERROR] {symbol} {timeframe}: {e}', flush=True)
         return None
 
-    price = float(d5.close.iloc[-1])
-    t1, t15 = trend(d1h), trend(d15)
-    sw, extreme, _ = liquidity_sweep(d5)
-    dp = displacement(d5)
-    side = sw or dp
-    if not side:
-        if bos(d5, "LONG"):
-            side = "LONG"
-        elif bos(d5, "SHORT"):
-            side = "SHORT"
-    if not side:
-        return None
 
-    events = event_flags(d5, side, window=12)
-    has_sweep = bool(events["sweep"])
-    has_disp = bool(events["disp"])
-    has_bos = bool(events["bos"])
-    has_react = bool(events["reaction"])
-
-    score = (
-        (35 if has_sweep else 0)
-        + (25 if has_disp else 0)
-        + (25 if has_bos else 0)
-        + (15 if has_react else 0)
-        + (10 if t15 == side else 0)
-        + (10 if t1 == side else -10 if t1 else 0)
-    )
-    reasons = []
-    for ok, name in [
-        (has_sweep, "SWEEP"),
-        (has_disp, "DISPLACEMENT"),
-        (has_react, "REACTION"),
-        (has_bos, "CHoCH/BOS"),
-        (t15 == side, "15M TREND"),
-        (t1 == side, "1H TREND"),
-    ]:
-        if ok:
-            reasons.append(name)
-
-    room, target = actual_room(d5, side, price, min_room=MIN_MOVE_PCT)
-    anchor = event_anchor(d5, side, events)
-    chase = 0.0
-    if anchor:
-        chase = (price / anchor - 1) * 100 if side == "LONG" else (anchor / price - 1) * 100
-
-    core = has_sweep and has_disp and has_bos and has_react
-    htf = t15 == side or t1 == side
-    # Core events must form a real chronological chain and be recent.
-    confirmed = core and sequence_ok(events, side) and htf and room >= MIN_MOVE_PCT and chase <= MAX_CHASE_PCT
-
-    if confirmed:
-        stage = "CONFIRMED"
-    elif (has_sweep and (has_react or has_bos)) or (has_disp and has_bos and has_react):
-        stage = "TRIGGER"
-    elif has_sweep or has_disp:
-        stage = "SETUP"
-    else:
-        return None
-
-    return {
-        "symbol": symbol,
-        "side": side,
-        "stage": stage,
-        "price": price,
-        "room": room,
-        "target": target,
-        "extreme": extreme,
-        "score": score,
-        "reasons": reasons,
-        "chase": chase,
-    }
+def ema(values, period):
+    if not values:
+        return 0.0
+    k = 2.0 / (period + 1)
+    x = float(values[0])
+    for v in values[1:]:
+        x = float(v) * k + x * (1 - k)
+    return x
 
 
-def send_signal(s):
-    # Telegram group receives only confirmed entries.
-    # SETUP/TRIGGER are still calculated internally for the confirmation logic
-    # and remain visible in Railway logs, but are not sent to the group.
-    if s["stage"] != "CONFIRMED":
-        logging.info(
-            "SUPPRESS TELEGRAM %s %s stage=%s | confirmation not reached",
-            s["symbol"], s["side"], s["stage"],
-        )
+def context_5m(rows):
+    closed = rows[:-1]
+    if len(closed) < 60:
+        return 'NEUTRAL'
+    closes = [r[4] for r in closed]
+    e20 = ema(closes[-50:], 20)
+    e50 = ema(closes[-60:], 50)
+    return 'LONG' if e20 > e50 else 'SHORT' if e20 < e50 else 'NEUTRAL'
+
+
+def detect(symbol):
+    m5 = fetch(symbol, '5m', 100)
+    m1 = fetch(symbol, '1m', 120)
+    if not m5 or not m1 or len(m5) < 70 or len(m1) < 40:
         return
 
-    key = f"{s['symbol']}:{s['side']}:{s['stage']}"
+    ctx = context_5m(m5)
+    d = m1[:-1]  # ignore unfinished 1m candle
+    e = d[-1]
+    prev = d[-5:-1]
+
+    highs_12 = [r[2] for r in d[-13:-1]]
+    lows_12 = [r[3] for r in d[-13:-1]]
+    rh = max(highs_12)
+    rl = min(lows_12)
+
+    bull_sweep = (e[3] < rl and e[4] > rl) or any(r[3] < rl and r[4] > rl for r in prev)
+    bear_sweep = (e[2] > rh and e[4] < rh) or any(r[2] > rh and r[4] < rh for r in prev)
+
+    bodies = [abs(r[4] - r[1]) for r in d[-24:-4]]
+    bodies_sorted = sorted(bodies)
+    med = bodies_sorted[len(bodies_sorted)//2] if bodies_sorted else 0
+    min_body = max(med * 1.4, e[4] * 0.0007)
+
+    bull_disp = e[4] > e[1] and (e[4] - e[1]) >= min_body
+    bear_disp = e[4] < e[1] and (e[1] - e[4]) >= min_body
+
+    prev_high = max(r[2] for r in d[-5:-1])
+    prev_low = min(r[3] for r in d[-5:-1])
+    bull_bos = e[4] > prev_high
+    bear_bos = e[4] < prev_low
+
+    long_ok = ctx == 'LONG' and bull_sweep and bull_disp and bull_bos
+    short_ok = ctx == 'SHORT' and bear_sweep and bear_disp and bear_bos
+    if not (long_ok or short_ok):
+        return
+
+    side = 'LONG' if long_ok else 'SHORT'
+    entry = float(e[4])
+    sweep_level = float(rl if side == 'LONG' else rh)
+    if abs(entry - sweep_level) / sweep_level > 0.0025:
+        print(f'[ANTI-CHASE] {symbol} {side}', flush=True)
+        return
+
+    if side == 'LONG':
+        sweep_lows = [r[3] for r in d if r[3] < rl]
+        sl_base = sweep_lows[-1] if sweep_lows else min(r[3] for r in d[-8:])
+        sl = sl_base * 0.9985
+        future_highs = [r[2] for r in d[-50:-1] if r[2] > entry]
+        tp = min(future_highs) if future_highs else entry * (1 + MAX_ROOM)
+        tp = min(tp, entry * (1 + MAX_ROOM))
+        room = (tp - entry) / entry
+    else:
+        sweep_highs = [r[2] for r in d if r[2] > rh]
+        sl_base = sweep_highs[-1] if sweep_highs else max(r[2] for r in d[-8:])
+        sl = sl_base * 1.0015
+        future_lows = [r[3] for r in d[-50:-1] if r[3] < entry]
+        tp = max(future_lows) if future_lows else entry * (1 - MAX_ROOM)
+        tp = max(tp, entry * (1 - MAX_ROOM))
+        room = (entry - tp) / entry
+
+    risk = abs(entry - sl) / entry
+    if room < MIN_ROOM or risk > 0.015:
+        return
+
+    key = (symbol, side, round(entry, 8))
     now = time.time()
-    if now - last_alert.get(key, 0) < COOLDOWN:
+    if now - last_sent.get(key, 0) < COOLDOWN_SECONDS:
         return
+    last_sent[key] = now
 
-    p = s["price"]
-    target = s["target"]
-    # For SETUP/TRIGGER we may show a provisional 0.7% reference TP.
-    # CONFIRMED never uses a synthetic TP: it must have a real target.
-    if target is None:
-        if s["stage"] == "CONFIRMED":
-            return
-        tp = p * (1 + MIN_MOVE_PCT / 100) if s["side"] == "LONG" else p * (1 - MIN_MOVE_PCT / 100)
-    else:
-        tp = target
-
-    ex = s["extreme"]
-    sl = ex if ex else (p * 0.995 if s["side"] == "LONG" else p * 1.005)
-    title = (
-        "🟡 FAST MOVE SETUP" if s["stage"] == "SETUP"
-        else "🟠 TRIGGER" if s["stage"] == "TRIGGER"
-        else "🟢 CONFIRMED ENTRY"
-    )
+    icon = '🟢' if side == 'LONG' else '🔴'
     msg = (
-        f"{title}\n\n{s['symbol']}\n"
-        f"{'LONG 🟢' if s['side'] == 'LONG' else 'SHORT 🔴'}\n"
-        f"Price: {p}\nPotential room: {s['room']:.2f}%\n"
-        f"Score: {s['score']}\nSignals: {', '.join(s['reasons'])}\n\n"
-        f"Entry: {p}\nSL: {sl}\nTP: {tp}\nLeverage: {LEV}x\n\n"
-        "V7.4 AUDITED"
+        f'{icon} CONFIRMED SCALP\n\n{symbol}\n\n{side}\n\n'
+        f'Price: {entry:.8g}\n5m Context: {ctx}\n'
+        f'Trigger: SWEEP + DISPLACEMENT + REACTION + CHoCH/BOS\n'
+        f'Potential room: {room*100:.2f}%\n\n'
+        f'Entry: {entry:.8g}\nSL: {sl:.8g}\nTP: {tp:.8g}\n\n'
+        f'Leverage: {LEVERAGE}x\n'
+        f'TP potential ROI: +{room*LEVERAGE*100:.1f}% (before fees/funding)\n'
+        f'SL potential ROI: -{risk*LEVERAGE*100:.1f}% (before fees/funding)\n\nSCALP V2\n\n'
+        f'<b>Трейдер Василь Павлів</b>\n'
+        f'https://t.me/vasylpavliv'
     )
-    if tg(msg):
-        last_alert[key] = now
-    logging.info(
-        "%s %s %s room=%.2f score=%s chase=%.2f reasons=%s",
-        s["symbol"], s["side"], s["stage"], s["room"], s["score"], s["chase"], ",".join(s["reasons"]),
-    )
+    print('[SIGNAL]', symbol, side, entry, flush=True)
+    send(msg)
 
 
-def scan(symbol):
-    d5 = get(symbol, "5m", 180)
-    d15 = get(symbol, "15m", 100)
-    d1h = get(symbol, "1h", 100)
-    if d5.empty or d15.empty or d1h.empty:
-        return
-    s = signal_for(symbol, d5, d15, d1h)
-    if s:
-        state = (s["side"], s["stage"])
-        if state != last_state.get(symbol):
-            send_signal(s)
-            last_state[symbol] = state
-    else:
-        last_state.pop(symbol, None)
-    time.sleep(PAUSE)
+print('Connecting to MEXC...', flush=True)
+try:
+    ex.load_markets()
+    print(f'MEXC connected. Markets loaded: {len(ex.markets)}', flush=True)
+except Exception as e:
+    print('[MEXC INIT ERROR]', repr(e), flush=True)
+    traceback.print_exc()
 
-
-def main():
-    tg(
-        "🤖 Crypto Signal Bot V7.4 AUDITED запущений\n\n"
-        "MEXC Futures\n"
-        "🟢 У групу надсилаються тільки CONFIRMED ENTRY\n\n"
-        "Ловимо початок швидкого руху. CONFIRMED тільки при реальному room ≥ 0.7%.\n"
-        "5m trigger + 15m/1H context. 30x. Без авто-торгівлі."
-    )
-    logging.info("V7.4 AUDITED started")
-    while True:
-        started = time.time()
-        for symbol in SYMBOLS:
-            try:
-                scan(symbol)
-            except Exception as e:
-                logging.warning("%s scan error: %s", symbol, e)
-        time.sleep(max(5, FAST_SECONDS - (time.time() - started)))
-
-
-if __name__ == "__main__":
-    main()
+print('=== SCALP BOT V2 RUNNING ===', flush=True)
+while True:
+    cycle_start = time.time()
+    for symbol in SYMBOLS:
+        try:
+            detect(symbol)
+        except Exception as e:
+            print(f'[DETECT ERROR] {symbol}: {e}', flush=True)
+    elapsed = time.time() - cycle_start
+    time.sleep(max(1, SCAN_SECONDS - elapsed))
