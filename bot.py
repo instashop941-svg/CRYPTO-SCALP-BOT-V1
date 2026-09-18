@@ -1,6 +1,6 @@
 import os, time, traceback
 
-print("=== CRYPTO SCALP BOT V3 STARTING ===", flush=True)
+print("=== CRYPTO SCALP BOT V4 STARTING ===", flush=True)
 
 try:
     import ccxt
@@ -18,7 +18,7 @@ SYMBOLS = [s.strip() for s in os.getenv(
 
 SCAN_SECONDS = max(15, int(os.getenv("SCAN_SECONDS", "30")))
 COOLDOWN_SECONDS = max(60, int(os.getenv("COOLDOWN_SECONDS", "900")))
-MIN_ROOM = float(os.getenv("MIN_ROOM", "0.005"))
+MIN_ROOM = float(os.getenv("MIN_ROOM", "0.0035"))
 MAX_ROOM = float(os.getenv("MAX_ROOM", "0.007"))
 LEVERAGE = int(os.getenv("LEVERAGE", "30"))
 HEARTBEAT_SECONDS = max(60, int(os.getenv("HEARTBEAT_SECONDS", "300")))
@@ -28,6 +28,7 @@ last_sent = {}
 last_heartbeat = 0.0
 
 print("Symbols:", ", ".join(SYMBOLS), flush=True)
+print(f"Room filter: {MIN_ROOM*100:.2f}% - {MAX_ROOM*100:.2f}% | RR min: 1.15 | Chase max: 0.25%", flush=True)
 print("Telegram configured:", bool(TG and CHAT), flush=True)
 print("Chat ID configured:", CHAT if CHAT else "<empty>", flush=True)
 
@@ -113,6 +114,16 @@ def detect(symbol):
     long_ok = ctx == "LONG" and bull_sweep and bull_reaction and bull_disp and bull_bos
     short_ok = ctx == "SHORT" and bear_sweep and bear_reaction and bear_disp and bear_bos
     if not (long_ok or short_ok):
+        if ctx == "LONG":
+            if not bull_sweep: print(f"[FILTER SWEEP] {symbol} LONG", flush=True)
+            elif not bull_reaction: print(f"[FILTER REACTION] {symbol} LONG", flush=True)
+            elif not bull_disp: print(f"[FILTER DISPLACEMENT] {symbol} LONG", flush=True)
+            elif not bull_bos: print(f"[FILTER BOS] {symbol} LONG", flush=True)
+        elif ctx == "SHORT":
+            if not bear_sweep: print(f"[FILTER SWEEP] {symbol} SHORT", flush=True)
+            elif not bear_reaction: print(f"[FILTER REACTION] {symbol} SHORT", flush=True)
+            elif not bear_disp: print(f"[FILTER DISPLACEMENT] {symbol} SHORT", flush=True)
+            elif not bear_bos: print(f"[FILTER BOS] {symbol} SHORT", flush=True)
         return None
 
     side = "LONG" if long_ok else "SHORT"
@@ -159,7 +170,7 @@ def detect(symbol):
 
     icon = "🟢" if side == "LONG" else "🔴"
     msg = (
-        f"{icon} <b>CONFIRMED SCALP V3</b>\n\n"
+        f"{icon} <b>CONFIRMED SCALP V4</b>\n\n"
         f"<b>{symbol}</b>\n\n<b>{side}</b>\n\n"
         f"Price: {entry:.8g}\n5m Context: {ctx}\n"
         f"Trigger: SWEEP + REACTION + DISPLACEMENT + CHoCH/BOS\n"
@@ -168,19 +179,21 @@ def detect(symbol):
         f"Leverage: {LEVERAGE}x\n"
         f"TP potential ROI: +{room*LEVERAGE*100:.1f}% (before fees/funding)\n"
         f"SL potential ROI: -{risk*LEVERAGE*100:.1f}% (before fees/funding)\n\n"
-        f"<b>SCALP V3</b>\n\n<b>Трейдер Василь Павлів</b>\n"
+        f"<b>SCALP V4</b>\n\n<b>Трейдер Василь Павлів</b>\n"
         f"https://t.me/vasylpavliv"
     )
     print(f"[SIGNAL] {symbol} {side} entry={entry:.8g} tp={tp:.8g} sl={sl:.8g}", flush=True)
-    send(msg)
-    return True
+    sent = send(msg)
+    if not sent:
+        print(f"[SIGNAL WARNING] {symbol} {side} signal generated but Telegram send failed", flush=True)
+    return sent
 
 def heartbeat():
     global last_heartbeat
     now = time.time()
     if now - last_heartbeat >= HEARTBEAT_SECONDS:
         last_heartbeat = now
-        print(f"[HEARTBEAT] Scalp V3 alive | symbols={len(SYMBOLS)} | scan={SCAN_SECONDS}s", flush=True)
+        print(f"[HEARTBEAT] Scalp V4 alive | symbols={len(SYMBOLS)} | scan={SCAN_SECONDS}s", flush=True)
 
 print("Connecting to MEXC...", flush=True)
 try:
