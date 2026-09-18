@@ -1,16 +1,22 @@
-# Crypto Scalp Bot V1
+# CRYPTO SCALP BOT V2
 
-Separate experimental scalp bot. Does NOT modify V7.4.
+Railway worker for MEXC USDT-M perpetuals.
 
-5m context -> 1m trigger: LIQUIDITY -> SWEEP -> REACTION/DISPLACEMENT -> CHoCH/BOS -> FRESH ENTRY -> TP.
+## Required Railway Variables
+- TELEGRAM_BOT_TOKEN
+- TELEGRAM_CHAT_ID=-5583968944
 
-- Minimum potential room: 0.50%
-- Target room: up to 0.70%
-- 30x leverage in signals
-- Anti-chase filter
-- SL beyond sweep/local liquidity
-- Signal-only; manual execution
-- Unfinished 1m candle excluded
-- Cooldown per event
+Optional:
+- SYMBOLS
+- SCAN_SECONDS (default 20)
+- COOLDOWN_SECONDS (default 900)
+- MIN_ROOM (default 0.005)
+- MAX_ROOM (default 0.007)
+- LEVERAGE (default 30)
 
-Environment: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SYMBOLS, SCAN_SECONDS
+On startup the Deploy Logs must show:
+- RAILWAY START SCRIPT
+- CRYPTO SCALP BOT V2 STARTING
+- Imports OK
+- MEXC connected / MEXC INIT ERROR
+- SCALP BOT V2 RUNNING
