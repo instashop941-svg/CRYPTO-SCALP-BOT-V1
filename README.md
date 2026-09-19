@@ -43,3 +43,11 @@ This is intended to make it clear why the bot is quiet instead of silently retur
 - MAX_ROOM (default 0.007 = 0.70%)
 - LEVERAGE (default 30)
 - HEARTBEAT_SECONDS (default 300)
+
+
+## TP update
+- TP1 = 0.50% from entry
+- TP2 = existing V4 TP target (capped by the existing 0.70% MAX_ROOM)
+- SL unchanged
+- Signal detection logic unchanged
+- Telegram now displays TP1 and TP2

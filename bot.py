@@ -20,6 +20,7 @@ SCAN_SECONDS = max(15, int(os.getenv("SCAN_SECONDS", "30")))
 COOLDOWN_SECONDS = max(60, int(os.getenv("COOLDOWN_SECONDS", "900")))
 MIN_ROOM = float(os.getenv("MIN_ROOM", "0.0035"))
 MAX_ROOM = float(os.getenv("MAX_ROOM", "0.007"))
+TP1_PCT = float(os.getenv("TP1_PCT", "0.005"))
 LEVERAGE = int(os.getenv("LEVERAGE", "30"))
 HEARTBEAT_SECONDS = max(60, int(os.getenv("HEARTBEAT_SECONDS", "300")))
 TG = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -141,6 +142,7 @@ def detect(symbol):
         candidates = [r[2] for r in d[-60:-1] if r[2] > entry and r[2] > rh]
         tp = min(candidates) if candidates else entry * (1 + MAX_ROOM)
         tp = min(tp, entry * (1 + MAX_ROOM))
+        tp1 = entry * (1 + TP1_PCT)
         room = (tp - entry) / entry
     else:
         sweep_highs = [r[2] for r in d[-13:] if r[2] > rh]
@@ -149,7 +151,12 @@ def detect(symbol):
         candidates = [r[3] for r in d[-60:-1] if r[3] < entry and r[3] < rl]
         tp = max(candidates) if candidates else entry * (1 - MAX_ROOM)
         tp = max(tp, entry * (1 - MAX_ROOM))
+        tp1 = entry * (1 - TP1_PCT)
         room = (entry - tp) / entry
+
+    if (side == "LONG" and tp < tp1) or (side == "SHORT" and tp > tp1):
+        print(f"[FILTER TP] {symbol} {side} TP2 does not reach TP1", flush=True)
+        return None
 
     risk = abs(entry - sl) / entry
     if room < MIN_ROOM:
@@ -175,14 +182,15 @@ def detect(symbol):
         f"Price: {entry:.8g}\n5m Context: {ctx}\n"
         f"Trigger: SWEEP + REACTION + DISPLACEMENT + CHoCH/BOS\n"
         f"Potential room: {room*100:.2f}%\n\n"
-        f"Entry: {entry:.8g}\nSL: {sl:.8g}\nTP: {tp:.8g}\n\n"
+        f"Entry: {entry:.8g}\nSL: {sl:.8g}\nTP1: {tp1:.8g}\nTP2: {tp:.8g}\n\n"
         f"Leverage: {LEVERAGE}x\n"
-        f"TP potential ROI: +{room*LEVERAGE*100:.1f}% (before fees/funding)\n"
+        f"TP1 potential ROI: +{TP1_PCT*LEVERAGE*100:.1f}% (before fees/funding)\n"
+        f"TP2 potential ROI: +{room*LEVERAGE*100:.1f}% (before fees/funding)\n"
         f"SL potential ROI: -{risk*LEVERAGE*100:.1f}% (before fees/funding)\n\n"
         f"<b>SCALP V4</b>\n\n<b>Трейдер Василь Павлів</b>\n"
         f"https://t.me/vasylpavliv"
     )
-    print(f"[SIGNAL] {symbol} {side} entry={entry:.8g} tp={tp:.8g} sl={sl:.8g}", flush=True)
+    print(f"[SIGNAL] {symbol} {side} entry={entry:.8g} tp1={tp1:.8g} tp2={tp:.8g} sl={sl:.8g}", flush=True)
     sent = send(msg)
     if not sent:
         print(f"[SIGNAL WARNING] {symbol} {side} signal generated but Telegram send failed", flush=True)
