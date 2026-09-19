@@ -1,4 +1,4 @@
-import os, time, traceback
+
 
 print("=== CRYPTO SCALP BOT V5.1 POI/LIQUIDITY STARTING ===", flush=True)
 
@@ -23,6 +23,7 @@ MAX_ROOM = float(os.getenv("MAX_ROOM", "0.007"))
 TP1_PCT = float(os.getenv("TP1_PCT", "0.005"))
 TP2_PCT = float(os.getenv("TP2_PCT", "0.007"))
 MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", "0.025"))
+MAX_CHASE_PCT = float(os.getenv("MAX_CHASE_PCT", "0.0025"))
 LEVERAGE = int(os.getenv("LEVERAGE", "30"))
 HEARTBEAT_SECONDS = max(60, int(os.getenv("HEARTBEAT_SECONDS", "300")))
 TG = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
