@@ -1,5 +1,6 @@
 
 
+
 print("=== CRYPTO SCALP BOT V5.1 POI/LIQUIDITY STARTING ===", flush=True)
 
 try:
@@ -307,7 +308,7 @@ while True:
         except Exception as e:
             print(f"[DETECT ERROR] {symbol}: {e}", flush=True)
             traceback.print_exc()
-
+            
     heartbeat()
     elapsed = time.time() - cycle_start
     sleep_for = max(1, SCAN_SECONDS - elapsed)
