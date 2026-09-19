@@ -1,6 +1,6 @@
 import os, time, traceback
 
-print("=== CRYPTO SCALP BOT V5 POI/LIQUIDITY STARTING ===", flush=True)
+print("=== CRYPTO SCALP BOT V5.1 POI/LIQUIDITY STARTING ===", flush=True)
 
 try:
     import ccxt
@@ -23,7 +23,6 @@ MAX_ROOM = float(os.getenv("MAX_ROOM", "0.007"))
 TP1_PCT = float(os.getenv("TP1_PCT", "0.005"))
 TP2_PCT = float(os.getenv("TP2_PCT", "0.007"))
 MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", "0.025"))
-MAX_CHASE_PCT = float(os.getenv("MAX_CHASE_PCT", "0.0025"))
 LEVERAGE = int(os.getenv("LEVERAGE", "30"))
 HEARTBEAT_SECONDS = max(60, int(os.getenv("HEARTBEAT_SECONDS", "300")))
 TG = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -111,11 +110,17 @@ def detect(symbol):
         return None
 
     e = d[-1]
-    base_start = max(10, len(d)-20)
+    # Recent liquidity range. Sweep can happen in the last 8 closed candles.
+    base_start = max(10, len(d)-60)
     sweep_idx = None
     side = None
     sweep_level = None
     sweep_extreme = None
+    # V5.1: prefer the most recent sweep that matches the 5m context.
+    # This avoids discarding a valid LONG because a later opposite-side sweep
+    # is the newest event in the raw 1m window.
+    preferred = ctx if ctx in ("LONG", "SHORT") else None
+    candidates = []
     for i in range(len(d)-1, base_start-1, -1):
         prev = d[max(0, i-12):i]
         if len(prev) < 5: continue
@@ -123,9 +128,16 @@ def detect(symbol):
         hi = max(float(r[2]) for r in prev)
         c = d[i]
         if float(c[3]) < lo and float(c[4]) > lo:
-            side, sweep_idx, sweep_level, sweep_extreme = "LONG", i, lo, float(c[3]); break
+            candidates.append((i, "LONG", lo, float(c[3])))
         if float(c[2]) > hi and float(c[4]) < hi:
-            side, sweep_idx, sweep_level, sweep_extreme = "SHORT", i, hi, float(c[2]); break
+            candidates.append((i, "SHORT", hi, float(c[2])))
+    if preferred:
+        matching = [x for x in candidates if x[1] == preferred]
+        chosen = matching[0] if matching else (candidates[0] if candidates else None)
+    else:
+        chosen = candidates[0] if candidates else None
+    if chosen:
+        sweep_idx, side, sweep_level, sweep_extreme = chosen
     if not side:
         print(f"[FILTER SWEEP] {symbol} no recent SSL/BSL sweep", flush=True)
         return None
@@ -134,16 +146,21 @@ def detect(symbol):
         print(f"[FILTER CONTEXT] {symbol} sweep={side} 5m={ctx}", flush=True)
         return None
 
+    # POI = last opposite/indecision candle immediately before the displacement leg.
+    # We first look for a strong directional candle after the sweep.
     bodies = [abs(float(r[4])-float(r[1])) for r in d[max(0,sweep_idx):len(d)-2]]
     med = median(bodies[-24:])
     disp_idx = None
-    for i in range(sweep_idx+1, len(d)):
+    # V5.1: first qualifying displacement after the selected sweep.
+    for i in range(sweep_idx+1, len(d)-1):
         c=d[i]
         body=abs(float(c[4])-float(c[1]))
         if side == "LONG" and float(c[4])>float(c[1]) and body>=max(med*1.35, float(c[4])*0.0006):
             disp_idx=i
+            break
         elif side == "SHORT" and float(c[4])<float(c[1]) and body>=max(med*1.35, float(c[4])*0.0006):
             disp_idx=i
+            break
     if disp_idx is None:
         print(f"[FILTER DISPLACEMENT] {symbol} {side}", flush=True)
         return None
@@ -151,24 +168,34 @@ def detect(symbol):
     poi_idx=max(sweep_idx, disp_idx-1)
     poi=d[poi_idx]
     poi_low=float(poi[3]); poi_high=float(poi[2])
+    # POI must be retested after the sweep/displacement, not entered from nowhere.
     retest_idx=None
-    for i in range(poi_idx+1, len(d)):
+    # First meaningful retest after the displacement; do not keep replacing it
+    # with later candles because that can shift the setup away from the original POI.
+    for i in range(max(poi_idx+1, disp_idx+1), len(d)-1):
         c=d[i]
         if float(c[3]) <= poi_high and float(c[2]) >= poi_low:
             retest_idx=i
+            break
     if retest_idx is None or retest_idx >= len(d)-1:
         print(f"[FILTER POI] {symbol} {side} no POI retest", flush=True)
         return None
 
+    # Reaction after POI retest.
     reaction_idx=None
-    for i in range(retest_idx+1, len(d)):
+    for i in range(retest_idx+1, len(d)-1):
         c=d[i]
-        if side=="LONG" and float(c[4])>float(c[1]) and float(c[4])>float(d[i-1][4]): reaction_idx=i
-        if side=="SHORT" and float(c[4])<float(c[1]) and float(c[4])<float(d[i-1][4]): reaction_idx=i
+        if side=="LONG" and float(c[4])>float(c[1]) and float(c[4])>float(d[i-1][4]):
+            reaction_idx=i
+            break
+        if side=="SHORT" and float(c[4])<float(c[1]) and float(c[4])<float(d[i-1][4]):
+            reaction_idx=i
+            break
     if reaction_idx is None:
         print(f"[FILTER REACTION] {symbol} {side}", flush=True)
         return None
 
+    # CHoCH/BOS: close through the local structure created before the reaction.
     structure = d[max(0,retest_idx-4):retest_idx]
     if len(structure)<2: return None
     local_high=max(float(r[2]) for r in structure)
@@ -182,6 +209,7 @@ def detect(symbol):
         print(f"[FILTER BOS] {symbol} {side}", flush=True)
         return None
 
+    # IMB/FVG after the structure shift.
     fvg=fvg_after(d, side, bos_idx)
     if not fvg:
         print(f"[FILTER IMB] {symbol} {side}", flush=True)
@@ -189,28 +217,34 @@ def detect(symbol):
     fvg_low,fvg_high,fvg_idx=fvg
 
     entry=float(e[4])
+    # Price must remain close to the event/POI area; no chasing an already-run move.
     anchor=float(d[bos_idx][4])
     chase=(entry-anchor)/anchor if side=="LONG" else (anchor-entry)/anchor
     if chase > MAX_CHASE_PCT:
         print(f"[ANTI-CHASE] {symbol} {side} chase={chase*100:.2f}%", flush=True)
         return None
 
+    # Entry should be near the fresh imbalance or POI, not far beyond it.
     zone_mid=(fvg_low+fvg_high)/2
     zone_dist=abs(entry-zone_mid)/zone_mid
     if zone_dist > 0.0035:
         print(f"[FILTER IMB DIST] {symbol} {side} dist={zone_dist*100:.2f}%", flush=True)
         return None
 
+    # Scalp targets are deliberately small: the goal is the first 0.50–0.70% move.
     tp1=entry*(1+TP1_PCT) if side=="LONG" else entry*(1-TP1_PCT)
     tp2=entry*(1+TP2_PCT) if side=="LONG" else entry*(1-TP2_PCT)
 
+    # Structural SL: beyond the sweep extreme and POI invalidation, with a small buffer.
     if side=="LONG":
         invalid=min(sweep_extreme, poi_low, fvg_low)
         sl=invalid*0.9985
+        room=TP2_PCT
         risk=(entry-sl)/entry
     else:
         invalid=max(sweep_extreme, poi_high, fvg_high)
         sl=invalid*1.0015
+        room=TP2_PCT
         risk=(sl-entry)/entry
 
     if risk > MAX_RISK_PCT:
@@ -237,7 +271,7 @@ def detect(symbol):
         f"TP1 potential ROI: +{TP1_PCT*LEVERAGE*100:.1f}% (before fees/funding)\n"
         f"TP2 potential ROI: +{TP2_PCT*LEVERAGE*100:.1f}% (before fees/funding)\n"
         f"SL potential ROI: -{risk*LEVERAGE*100:.1f}% (before fees/funding)\n\n"
-        f"<b>SCALP V5 — POI/LIQUIDITY</b>\n\n<b>Трейдер Василь Павлів</b>\n"
+        f"<b>SCALP V5.1 — POI/LIQUIDITY</b>\n\n<b>Трейдер Василь Павлів</b>\n"
         f"https://t.me/vasylpavliv"
     )
     print(f"[SIGNAL] {symbol} {side} entry={entry:.8g} sl={sl:.8g} tp1={tp1:.8g} tp2={tp2:.8g} risk={risk*100:.2f}%", flush=True)
@@ -251,7 +285,7 @@ def heartbeat():
     now = time.time()
     if now - last_heartbeat >= HEARTBEAT_SECONDS:
         last_heartbeat = now
-        print(f"[HEARTBEAT] Scalp V5 alive | symbols={len(SYMBOLS)} | scan={SCAN_SECONDS}s", flush=True)
+        print(f"[HEARTBEAT] Scalp V5.1 alive | symbols={len(SYMBOLS)} | scan={SCAN_SECONDS}s", flush=True)
 
 print("Connecting to MEXC...", flush=True)
 try:
