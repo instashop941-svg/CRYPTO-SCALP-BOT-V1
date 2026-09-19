@@ -1,53 +1,41 @@
-# CRYPTO SCALP BOT V4
+# CRYPTO SCALP BOT V5 — POI / LIQUIDITY
 
-Based on Scalp V3, with more practical scalp room and detailed filter diagnostics.
+Based on Scalp V4, redesigned around the VIRTUALUSDT-style sequence:
+
+LIQUIDITY SWEEP → POI TEST → REACTION → DISPLACEMENT → CHoCH/BOS → IMB → 0.50–0.70% MOVE
 
 ## Core
+- MEXC Futures via ccxt
+- 1m closed candles for trigger
 - 5m EMA20/EMA50 context
-- closed 1m candles only
-- liquidity sweep
-- reaction
-- displacement
-- local CHoCH/BOS
+- SSL/BSL liquidity sweep
+- POI detection from the origin candle of the displacement move
+- POI retest required after sweep
+- reaction required after POI test
+- displacement required
+- local CHoCH/BOS required
+- fresh 3-candle IMB/FVG required after displacement
 - anti-chase <= 0.25%
-- minimum potential room 0.35%
-- maximum potential room 0.70%
-- risk <= 1.50%
-- RR >= 1.15
-- TP from recent local liquidity when available
-- cooldown 15 minutes per symbol/side/entry
-- Telegram only for confirmed entries
+- TP1 = 0.50%
+- TP2 = 0.70%
+- liquidity-aware SL beyond the sweep / POI invalidation, not a fixed tight stop
+- no RR filter: the strategy prioritizes the 0.50–0.70% scalp target while the SL is structural
+- maximum structural risk 2.50% by default
+- Telegram only confirmed entries
 - default leverage 30x
 
-## Diagnostics
-Railway logs now show which confirmation stage filters a candidate:
-- FILTER SWEEP
-- FILTER REACTION
-- FILTER DISPLACEMENT
-- FILTER BOS
-- FILTER ROOM
-- FILTER RISK
-- FILTER RR
-- ANTI-CHASE
-- SIGNAL
+## Important
+A wide structural SL does NOT mean risking the same amount of capital as a tight SL. Position sizing should be reduced separately when the structural SL is wider.
 
-This is intended to make it clear why the bot is quiet instead of silently returning.
-
-## Environment variables
+## Railway environment variables
 - TELEGRAM_BOT_TOKEN
 - TELEGRAM_CHAT_ID
 - SYMBOLS
 - SCAN_SECONDS (default 30)
 - COOLDOWN_SECONDS (default 900)
-- MIN_ROOM (default 0.0035 = 0.35%)
-- MAX_ROOM (default 0.007 = 0.70%)
+- TP1_PCT (default 0.005)
+- TP2_PCT (default 0.007)
+- MAX_RISK_PCT (default 0.025)
+- MAX_CHASE_PCT (default 0.0025)
 - LEVERAGE (default 30)
 - HEARTBEAT_SECONDS (default 300)
-
-
-## TP update
-- TP1 = 0.50% from entry
-- TP2 = existing V4 TP target (capped by the existing 0.70% MAX_ROOM)
-- SL unchanged
-- Signal detection logic unchanged
-- Telegram now displays TP1 and TP2

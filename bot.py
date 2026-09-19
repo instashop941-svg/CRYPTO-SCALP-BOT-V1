@@ -1,6 +1,6 @@
 import os, time, traceback
 
-print("=== CRYPTO SCALP BOT V4 STARTING ===", flush=True)
+print("=== CRYPTO SCALP BOT V5 POI/LIQUIDITY STARTING ===", flush=True)
 
 try:
     import ccxt
@@ -18,9 +18,11 @@ SYMBOLS = [s.strip() for s in os.getenv(
 
 SCAN_SECONDS = max(15, int(os.getenv("SCAN_SECONDS", "30")))
 COOLDOWN_SECONDS = max(60, int(os.getenv("COOLDOWN_SECONDS", "900")))
-MIN_ROOM = float(os.getenv("MIN_ROOM", "0.0035"))
+MIN_ROOM = float(os.getenv("MIN_ROOM", "0.005"))
 MAX_ROOM = float(os.getenv("MAX_ROOM", "0.007"))
 TP1_PCT = float(os.getenv("TP1_PCT", "0.005"))
+TP2_PCT = float(os.getenv("TP2_PCT", "0.007"))
+MAX_RISK_PCT = float(os.getenv("MAX_RISK_PCT", "0.025"))
 LEVERAGE = int(os.getenv("LEVERAGE", "30"))
 HEARTBEAT_SECONDS = max(60, int(os.getenv("HEARTBEAT_SECONDS", "300")))
 TG = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -29,7 +31,7 @@ last_sent = {}
 last_heartbeat = 0.0
 
 print("Symbols:", ", ".join(SYMBOLS), flush=True)
-print(f"Room filter: {MIN_ROOM*100:.2f}% - {MAX_ROOM*100:.2f}% | RR min: 1.15 | Chase max: 0.25%", flush=True)
+print(f"Target move: 0.50% - 0.70% | Structural SL max: {MAX_RISK_PCT*100:.2f}% | Chase max: {MAX_CHASE_PCT*100:.2f}%", flush=True)
 print("Telegram configured:", bool(TG and CHAT), flush=True)
 print("Chat ID configured:", CHAT if CHAT else "<empty>", flush=True)
 
@@ -80,118 +82,178 @@ def context_5m(rows):
     e50 = ema(closes[-60:], 50)
     return "LONG" if e20 > e50 else "SHORT" if e20 < e50 else "NEUTRAL"
 
+def median(values):
+    vals=sorted(float(x) for x in values if x is not None)
+    if not vals: return 0.0
+    return vals[len(vals)//2]
+
+def fvg_after(rows, side, start_idx):
+    # 3-candle imbalance/FVG. Return the newest valid zone after start_idx.
+    if len(rows) < 4: return None
+    for i in range(len(rows)-1, max(start_idx+1, 2), -1):
+        a,b,c=rows[i-2],rows[i-1],rows[i]
+        if side == "LONG" and float(a[2]) < float(c[3]):
+            return (float(a[2]), float(c[3]), i)
+        if side == "SHORT" and float(a[3]) > float(c[2]):
+            return (float(c[2]), float(a[3]), i)
+    return None
+
 def detect(symbol):
-    m5 = fetch(symbol, "5m", 120)
-    m1 = fetch(symbol, "1m", 150)
-    if not m5 or not m1 or len(m5) < 75 or len(m1) < 45:
+    m5 = fetch(symbol, "5m", 150)
+    m1 = fetch(symbol, "1m", 180)
+    if not m5 or not m1 or len(m5) < 80 or len(m1) < 60:
         return None
 
     ctx = context_5m(m5)
-    d = m1[:-1]
-    e = d[-1]
-    prev4 = d[-5:-1]
-
-    highs = [r[2] for r in d[-13:-1]]
-    lows = [r[3] for r in d[-13:-1]]
-    rh, rl = max(highs), min(lows)
-
-    bull_sweep = (e[3] < rl and e[4] > rl) or any(r[3] < rl and r[4] > rl for r in prev4)
-    bear_sweep = (e[2] > rh and e[4] < rh) or any(r[2] > rh and r[4] < rh for r in prev4)
-
-    bodies = sorted(abs(r[4] - r[1]) for r in d[-24:-4])
-    med = bodies[len(bodies)//2] if bodies else 0.0
-    min_body = max(med * 1.4, e[4] * 0.0007)
-    bull_disp = e[4] > e[1] and (e[4] - e[1]) >= min_body
-    bear_disp = e[4] < e[1] and (e[1] - e[4]) >= min_body
-
-    bull_reaction = e[4] > e[1] and e[4] > rl
-    bear_reaction = e[4] < e[1] and e[4] < rh
-
-    prev_high = max(r[2] for r in prev4)
-    prev_low = min(r[3] for r in prev4)
-    bull_bos = e[4] > prev_high
-    bear_bos = e[4] < prev_low
-
-    long_ok = ctx == "LONG" and bull_sweep and bull_reaction and bull_disp and bull_bos
-    short_ok = ctx == "SHORT" and bear_sweep and bear_reaction and bear_disp and bear_bos
-    if not (long_ok or short_ok):
-        if ctx == "LONG":
-            if not bull_sweep: print(f"[FILTER SWEEP] {symbol} LONG", flush=True)
-            elif not bull_reaction: print(f"[FILTER REACTION] {symbol} LONG", flush=True)
-            elif not bull_disp: print(f"[FILTER DISPLACEMENT] {symbol} LONG", flush=True)
-            elif not bull_bos: print(f"[FILTER BOS] {symbol} LONG", flush=True)
-        elif ctx == "SHORT":
-            if not bear_sweep: print(f"[FILTER SWEEP] {symbol} SHORT", flush=True)
-            elif not bear_reaction: print(f"[FILTER REACTION] {symbol} SHORT", flush=True)
-            elif not bear_disp: print(f"[FILTER DISPLACEMENT] {symbol} SHORT", flush=True)
-            elif not bear_bos: print(f"[FILTER BOS] {symbol} SHORT", flush=True)
+    d = m1[:-1]  # never use unfinished 1m candle
+    if len(d) < 50:
         return None
 
-    side = "LONG" if long_ok else "SHORT"
-    entry = float(e[4])
-    sweep_level = float(rl if side == "LONG" else rh)
-    chase = abs(entry - sweep_level) / sweep_level
-    if chase > 0.0025:
+    e = d[-1]
+    # Recent liquidity range. Sweep can happen in the last 8 closed candles.
+    base_start = max(10, len(d)-20)
+    sweep_idx = None
+    side = None
+    sweep_level = None
+    sweep_extreme = None
+    for i in range(len(d)-1, base_start-1, -1):
+        prev = d[max(0, i-12):i]
+        if len(prev) < 5: continue
+        lo = min(float(r[3]) for r in prev)
+        hi = max(float(r[2]) for r in prev)
+        c = d[i]
+        if float(c[3]) < lo and float(c[4]) > lo:
+            side, sweep_idx, sweep_level, sweep_extreme = "LONG", i, lo, float(c[3]); break
+        if float(c[2]) > hi and float(c[4]) < hi:
+            side, sweep_idx, sweep_level, sweep_extreme = "SHORT", i, hi, float(c[2]); break
+    if not side:
+        print(f"[FILTER SWEEP] {symbol} no recent SSL/BSL sweep", flush=True)
+        return None
+
+    if ctx != side:
+        print(f"[FILTER CONTEXT] {symbol} sweep={side} 5m={ctx}", flush=True)
+        return None
+
+    # POI = last opposite/indecision candle immediately before the displacement leg.
+    # We first look for a strong directional candle after the sweep.
+    bodies = [abs(float(r[4])-float(r[1])) for r in d[max(0,sweep_idx):len(d)-2]]
+    med = median(bodies[-24:])
+    disp_idx = None
+    for i in range(sweep_idx+1, len(d)):
+        c=d[i]
+        body=abs(float(c[4])-float(c[1]))
+        if side == "LONG" and float(c[4])>float(c[1]) and body>=max(med*1.35, float(c[4])*0.0006):
+            disp_idx=i
+        elif side == "SHORT" and float(c[4])<float(c[1]) and body>=max(med*1.35, float(c[4])*0.0006):
+            disp_idx=i
+    if disp_idx is None:
+        print(f"[FILTER DISPLACEMENT] {symbol} {side}", flush=True)
+        return None
+
+    poi_idx=max(sweep_idx, disp_idx-1)
+    poi=d[poi_idx]
+    poi_low=float(poi[3]); poi_high=float(poi[2])
+    # POI must be retested after the sweep/displacement, not entered from nowhere.
+    retest_idx=None
+    for i in range(poi_idx+1, len(d)):
+        c=d[i]
+        if float(c[3]) <= poi_high and float(c[2]) >= poi_low:
+            retest_idx=i
+    if retest_idx is None or retest_idx >= len(d)-1:
+        print(f"[FILTER POI] {symbol} {side} no POI retest", flush=True)
+        return None
+
+    # Reaction after POI retest.
+    reaction_idx=None
+    for i in range(retest_idx+1, len(d)):
+        c=d[i]
+        if side=="LONG" and float(c[4])>float(c[1]) and float(c[4])>float(d[i-1][4]): reaction_idx=i
+        if side=="SHORT" and float(c[4])<float(c[1]) and float(c[4])<float(d[i-1][4]): reaction_idx=i
+    if reaction_idx is None:
+        print(f"[FILTER REACTION] {symbol} {side}", flush=True)
+        return None
+
+    # CHoCH/BOS: close through the local structure created before the reaction.
+    structure = d[max(0,retest_idx-4):retest_idx]
+    if len(structure)<2: return None
+    local_high=max(float(r[2]) for r in structure)
+    local_low=min(float(r[3]) for r in structure)
+    bos_idx=None
+    for i in range(reaction_idx, len(d)):
+        c=d[i]
+        if side=="LONG" and float(c[4])>local_high: bos_idx=i
+        if side=="SHORT" and float(c[4])<local_low: bos_idx=i
+    if bos_idx is None:
+        print(f"[FILTER BOS] {symbol} {side}", flush=True)
+        return None
+
+    # IMB/FVG after the structure shift.
+    fvg=fvg_after(d, side, bos_idx)
+    if not fvg:
+        print(f"[FILTER IMB] {symbol} {side}", flush=True)
+        return None
+    fvg_low,fvg_high,fvg_idx=fvg
+
+    entry=float(e[4])
+    # Price must remain close to the event/POI area; no chasing an already-run move.
+    anchor=float(d[bos_idx][4])
+    chase=(entry-anchor)/anchor if side=="LONG" else (anchor-entry)/anchor
+    if chase > MAX_CHASE_PCT:
         print(f"[ANTI-CHASE] {symbol} {side} chase={chase*100:.2f}%", flush=True)
         return None
 
-    if side == "LONG":
-        sweep_lows = [r[3] for r in d[-13:] if r[3] < rl]
-        sweep_low = min(sweep_lows, default=rl)
-        sl = sweep_low * 0.9985
-        candidates = [r[2] for r in d[-60:-1] if r[2] > entry and r[2] > rh]
-        tp = min(candidates) if candidates else entry * (1 + MAX_ROOM)
-        tp = min(tp, entry * (1 + MAX_ROOM))
-        tp1 = entry * (1 + TP1_PCT)
-        room = (tp - entry) / entry
+    # Entry should be near the fresh imbalance or POI, not far beyond it.
+    zone_mid=(fvg_low+fvg_high)/2
+    zone_dist=abs(entry-zone_mid)/zone_mid
+    if zone_dist > 0.0035:
+        print(f"[FILTER IMB DIST] {symbol} {side} dist={zone_dist*100:.2f}%", flush=True)
+        return None
+
+    # Scalp targets are deliberately small: the goal is the first 0.50–0.70% move.
+    tp1=entry*(1+TP1_PCT) if side=="LONG" else entry*(1-TP1_PCT)
+    tp2=entry*(1+TP2_PCT) if side=="LONG" else entry*(1-TP2_PCT)
+
+    # Structural SL: beyond the sweep extreme and POI invalidation, with a small buffer.
+    if side=="LONG":
+        invalid=min(sweep_extreme, poi_low, fvg_low)
+        sl=invalid*0.9985
+        room=TP2_PCT
+        risk=(entry-sl)/entry
     else:
-        sweep_highs = [r[2] for r in d[-13:] if r[2] > rh]
-        sweep_high = max(sweep_highs, default=rh)
-        sl = sweep_high * 1.0015
-        candidates = [r[3] for r in d[-60:-1] if r[3] < entry and r[3] < rl]
-        tp = max(candidates) if candidates else entry * (1 - MAX_ROOM)
-        tp = max(tp, entry * (1 - MAX_ROOM))
-        tp1 = entry * (1 - TP1_PCT)
-        room = (entry - tp) / entry
+        invalid=max(sweep_extreme, poi_high, fvg_high)
+        sl=invalid*1.0015
+        room=TP2_PCT
+        risk=(sl-entry)/entry
 
-    if (side == "LONG" and tp < tp1) or (side == "SHORT" and tp > tp1):
-        print(f"[FILTER TP] {symbol} {side} TP2 does not reach TP1", flush=True)
+    if risk > MAX_RISK_PCT:
+        print(f"[FILTER RISK] {symbol} {side} structural_risk={risk*100:.2f}%", flush=True)
         return None
 
-    risk = abs(entry - sl) / entry
-    if room < MIN_ROOM:
-        print(f"[FILTER ROOM] {symbol} {side} room={room*100:.2f}%", flush=True)
+    key=(symbol,side,round(entry,8))
+    now=time.time()
+    if now-last_sent.get(key,0)<COOLDOWN_SECONDS:
         return None
-    if risk > 0.015:
-        print(f"[FILTER RISK] {symbol} {side} risk={risk*100:.2f}%", flush=True)
-        return None
-    if risk > 0 and room / risk < 1.15:
-        print(f"[FILTER RR] {symbol} {side} RR={room/risk:.2f}", flush=True)
-        return None
+    last_sent[key]=now
 
-    key = (symbol, side, round(entry, 8))
-    now = time.time()
-    if now - last_sent.get(key, 0) < COOLDOWN_SECONDS:
-        return None
-    last_sent[key] = now
-
-    icon = "🟢" if side == "LONG" else "🔴"
-    msg = (
-        f"{icon} <b>CONFIRMED SCALP V4</b>\n\n"
+    icon="🟢" if side=="LONG" else "🔴"
+    msg=(
+        f"{icon} <b>CONFIRMED SCALP V5</b>\n\n"
         f"<b>{symbol}</b>\n\n<b>{side}</b>\n\n"
         f"Price: {entry:.8g}\n5m Context: {ctx}\n"
-        f"Trigger: SWEEP + REACTION + DISPLACEMENT + CHoCH/BOS\n"
-        f"Potential room: {room*100:.2f}%\n\n"
-        f"Entry: {entry:.8g}\nSL: {sl:.8g}\nTP1: {tp1:.8g}\nTP2: {tp:.8g}\n\n"
+        f"Trigger: SSL/BSL SWEEP + POI + REACTION + DISPLACEMENT + CHoCH/BOS + IMB\n"
+        f"Potential move: 0.50–0.70%\n\n"
+        f"POI: {poi_low:.8g} – {poi_high:.8g}\n"
+        f"IMB: {fvg_low:.8g} – {fvg_high:.8g}\n\n"
+        f"Entry: {entry:.8g}\nSL: {sl:.8g}\nTP1: {tp1:.8g}\nTP2: {tp2:.8g}\n\n"
         f"Leverage: {LEVERAGE}x\n"
         f"TP1 potential ROI: +{TP1_PCT*LEVERAGE*100:.1f}% (before fees/funding)\n"
-        f"TP2 potential ROI: +{room*LEVERAGE*100:.1f}% (before fees/funding)\n"
+        f"TP2 potential ROI: +{TP2_PCT*LEVERAGE*100:.1f}% (before fees/funding)\n"
         f"SL potential ROI: -{risk*LEVERAGE*100:.1f}% (before fees/funding)\n\n"
-        f"<b>SCALP V4</b>\n\n<b>Трейдер Василь Павлів</b>\n"
+        f"<b>SCALP V5 — POI/LIQUIDITY</b>\n\n<b>Трейдер Василь Павлів</b>\n"
         f"https://t.me/vasylpavliv"
     )
-    print(f"[SIGNAL] {symbol} {side} entry={entry:.8g} tp1={tp1:.8g} tp2={tp:.8g} sl={sl:.8g}", flush=True)
-    sent = send(msg)
+    print(f"[SIGNAL] {symbol} {side} entry={entry:.8g} sl={sl:.8g} tp1={tp1:.8g} tp2={tp2:.8g} risk={risk*100:.2f}%", flush=True)
+    sent=send(msg)
     if not sent:
         print(f"[SIGNAL WARNING] {symbol} {side} signal generated but Telegram send failed", flush=True)
     return sent
@@ -212,7 +274,7 @@ except Exception as e:
     traceback.print_exc()
     raise
 
-print("=== SCALP BOT V3 RUNNING ===", flush=True)
+print("=== SCALP BOT V5 POI/LIQUIDITY RUNNING ===", flush=True)
 
 while True:
     cycle_start = time.time()
